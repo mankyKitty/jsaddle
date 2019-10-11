@@ -20,6 +20,9 @@ module Language.Javascript.JSaddle.WebKitGTK (
 #ifndef ghcjs_HOST_OS
   , runInWebView
 #endif
+#ifdef linux_HOST_OS
+  , runLinuxWebView
+#endif
   ) where
 
 #ifdef ghcjs_HOST_OS
@@ -30,12 +33,14 @@ run = id
 
 #else
 
+import Debug.Trace (traceShowId,traceShowM)
 import Control.Monad (void)
 import Control.Monad.IO.Class (MonadIO(..), MonadIO)
 import Control.Concurrent (forkIO, yield)
 
 #ifndef mingw32_HOST_OS
 import System.Posix.Signals (installHandler, keyboardSignal, Handler(Catch))
+import System.Posix.Process (forkProcess, executeFile)
 #endif
 import System.Directory (getCurrentDirectory)
 
@@ -43,7 +48,8 @@ import Data.Monoid ((<>))
 import Data.ByteString.Lazy (toStrict, fromStrict)
 import qualified Data.ByteString.Lazy as LB (ByteString)
 import Data.Aeson (encode, decode)
-import qualified Data.Text as T (pack)
+import Data.Text (Text,pack)
+import qualified Data.Text as T
 import Data.Text.Encoding (decodeUtf8, encodeUtf8)
 
 import Data.GI.Base.BasicTypes (GObject)
@@ -60,7 +66,9 @@ import GI.Gtk
         widgetGetToplevel, widgetShowAll, onWidgetDestroy,
         mainQuit)
 import GI.Gio (noCancellable)
+import qualified GI.Gio as Gio
 import GI.JavaScriptCore (valueToString)
+import qualified GI.WebKit2 as WK2
 import GI.WebKit2
        (scriptDialogPromptSetText, scriptDialogPromptGetDefaultText,
         scriptDialogGetMessage, scriptDialogGetDialogType,
@@ -124,6 +132,66 @@ run main = do
     webViewLoadHtml webView "" . Just $ "file://" <> T.pack pwd <> "/index.html"
     installQuitHandler webView
     Gtk.main
+
+#ifdef linux_HOST_OS
+decidePolicyCallback
+  :: WK2.PolicyDecision
+  -> WK2.PolicyDecisionType
+  -> IO Bool
+decidePolicyCallback pd pt = case pt of
+  WK2.PolicyDecisionTypeNewWindowAction -> openUsingLocal
+  WK2.PolicyDecisionTypeNavigationAction -> openUsingLocal
+  _ -> False <$ traceShowM pt
+  where
+    openUsingLocal = do
+      np <- Gio.unsafeCastTo WK2.NavigationPolicyDecision pd
+      na <- WK2.navigationPolicyDecisionGetNavigationAction np
+      ntype <- traceShowId <$> WK2.navigationActionGetNavigationType na
+      case ntype of
+        WK2.NavigationTypeLinkClicked -> do
+          requested <- WK2.uRIRequestGetUri =<< WK2.navigationActionGetRequest na
+          forkProcess $ executeFile "xdg-open" True [T.unpack requested] Nothing
+          pure True
+        t ->
+          False <$ traceShowM t
+
+runLinuxWebView :: Text -> JSM () -> IO ()
+runLinuxWebView route main = do
+  _ <- Gtk.init Nothing
+  window <- windowNew WindowTypeToplevel
+  _ <- timeoutAdd PRIORITY_HIGH 10 (yield >> return True)
+  windowSetDefaultSize window 900 600
+  windowSetPosition window WindowPositionCenter
+  scrollWin <- scrolledWindowNew noAdjustment noAdjustment
+  contentManager <- userContentManagerNew
+  webView <- webViewNewWithUserContentManager contentManager
+  settings <- webViewGetSettings webView
+
+  WK2.setSettingsAllowUniversalAccessFromFileUrls settings True
+  WK2.setSettingsAllowFileAccessFromFileUrls settings True
+  WK2.setSettingsEnableDeveloperExtras settings True
+  WK2.setSettingsEnableJavascript settings True
+  WK2.setSettingsEnableWriteConsoleMessagesToStdout settings True
+
+  WK2.onWebViewDecidePolicy webView decidePolicyCallback
+
+  webViewSetSettings webView settings
+
+  window `containerAdd` scrollWin
+  scrollWin `containerAdd` webView
+  _ <- onWidgetDestroy window mainQuit
+  widgetShowAll window
+  pwd <- getCurrentDirectory
+  void . onWebViewLoadChanged webView $ \case
+      LoadEventFinished -> runInWebView main webView
+      _ -> return ()
+
+  let html = "<html><head></head><body></body></html>"
+  WK2.webViewLoadHtml webView html (Just route)
+
+  installQuitHandler webView
+  Gtk.main
+#endif
 
 runInWebView :: JSM () -> WebView -> IO ()
 runInWebView f webView = do
